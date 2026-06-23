@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Secretos y entorno local (NO subir: contiene el token de Telegram)
+.env
+
+# Base de datos / datos locales
+/data
+*.sqlite
+*.sqlite-*
+
+# OS
+.DS_Store
