@@ -8,6 +8,7 @@ mod indicators;
 mod models;
 mod nn;
 mod notify;
+mod rest_binance;
 mod runtime;
 mod signals;
 mod web;

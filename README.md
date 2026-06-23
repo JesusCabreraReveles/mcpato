@@ -94,6 +94,12 @@ Fuente live:
 - Stream: `btcusdt@kline_5m`.
 - Solo velas cerradas (`x == true`).
 
+Backfill al arrancar (calentamiento):
+- Binance REST `GET /api/v3/klines` (`MCPATO_BACKFILL_LIMIT` velas).
+- Descarta la vela en formación (solo cerradas).
+- Puebla contexto de indicadores, equity y buffer diario para no esperar a las
+  primeras velas en vivo. Se controla con `MCPATO_BACKFILL_ENABLED`.
+
 Reconexión:
 - Si se cae el socket, reconecta con backoff exponencial de 1s a 30s.
 
@@ -225,6 +231,8 @@ Principales:
 - `MCPATO_HTTP_BIND` (IP de escucha: `127.0.0.1` local, `0.0.0.0` red)
 - `MCPATO_HTTP_PORT` (puerto del dashboard)
 - `MCPATO_STALE_AFTER_SECS` (umbral de "datos atrasados" en el indicador de salud)
+- `MCPATO_BACKFILL_ENABLED` (descarga histórico al arrancar)
+- `MCPATO_BACKFILL_LIMIT` (cuántas velas históricas traer, máx 1000)
 - `MCPATO_MAX_GENERATIONS` (opcional)
 
 ## 12) Ejecutar local
@@ -458,7 +466,10 @@ Recomendaciones:
 - No hay ejecución multi-símbolo.
 - No hay migraciones versionadas; usa `CREATE TABLE IF NOT EXISTS` directo.
 - El seed se basa en timestamp de arranque.
-- El buffer diario empieza desde la ejecución actual (no reconstruye un día previo completo).
+- Con `MCPATO_BACKFILL_ENABLED=true` (por defecto) el buffer diario se precarga
+  con histórico REST, así que la primera generación se evalúa pronto y el
+  dashboard muestra datos desde el arranque. Con backfill desactivado, el buffer
+  empieza vacío (comportamiento V0).
 
 ## 15) Checklist rápido de validación
 

@@ -13,6 +13,7 @@ use crate::{
     models::{Candle, Genome, OrganismState},
     nn,
     notify::Notifier,
+    rest_binance,
     signals::{self, Stance},
     ws_binance,
 };
@@ -38,7 +39,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut rng = StdRng::seed_from_u64(cfg.seed as u64);
 
     let persisted_state = db.load_organism_state().await?;
-    let broker = if let Some(state) = persisted_state {
+    let had_persisted = persisted_state.is_some();
+    let broker = if let Some(state) = &persisted_state {
         PaperBroker {
             cash: state.cash,
             position_qty: state.position_qty,
@@ -52,8 +54,50 @@ pub async fn run(cfg: Config) -> Result<()> {
         PaperBroker::new(cfg.initial_capital)
     };
 
+    // Backfill histórico: descarga velas recientes desde la API REST para
+    // "calentar" indicadores/equity y disparar una generación temprana sin
+    // esperar a que cierren velas en vivo. Si falla, se continúa sin él.
+    if cfg.backfill_enabled {
+        match rest_binance::fetch_recent_klines(&cfg.symbol, &cfg.interval, cfg.backfill_limit).await
+        {
+            Ok(klines) => {
+                for c in &klines {
+                    db.insert_candle(c).await?;
+                }
+                println!(
+                    "Backfill: {} velas históricas cargadas desde Binance",
+                    klines.len()
+                );
+            }
+            Err(e) => eprintln!("warn: backfill falló (se continúa sin él): {e:#}"),
+        }
+    }
+
     let historical = db.load_recent_candles(600).await?;
-    let day_buffer = Vec::with_capacity(cfg.candles_per_day);
+
+    // Prefill del buffer diario con la cola del histórico, para que la primera
+    // generación se evalúe pronto (la próxima vela en vivo la completa).
+    let mut day_buffer = Vec::with_capacity(cfg.candles_per_day);
+    if cfg.backfill_enabled && historical.len() > 1 {
+        let keep = cfg.candles_per_day.saturating_sub(1).min(historical.len());
+        let start = historical.len() - keep;
+        day_buffer.extend_from_slice(&historical[start..]);
+    }
+
+    // Si no había estado persistido, escribe uno inicial para que el dashboard
+    // muestre equity desde el arranque (en vez de "—").
+    if !had_persisted {
+        let init = OrganismState {
+            cash: broker.cash,
+            position_qty: broker.position_qty,
+            entry_price: broker.entry_price,
+            equity: broker.equity,
+            initial_capital: cfg.initial_capital,
+            delta_vs_initial: broker.equity - cfg.initial_capital,
+            alive: true,
+        };
+        db.upsert_organism_state(&init).await?;
+    }
 
     let (default_champion, mut default_population) =
         evolution::bootstrap_population(&mut rng, &cfg);
