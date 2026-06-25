@@ -8,9 +8,14 @@
 //! así que se cobra el funding sobre el capital completo. Gated por
 //! MCPATO_CARRY_CHECK.
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Result};
 
 use crate::{config::Config, rest_binance};
+
+const DEFAULT_UNIVERSE: &str = "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,SOLUSDT,\
+DOGEUSDT,LTCUSDT,LINKUSDT,DOTUSDT,AVAXUSDT,TRXUSDT,ATOMUSDT,ETCUSDT,BCHUSDT,XLMUSDT";
 
 pub async fn run(cfg: Config) -> Result<()> {
     let days = env_u32("MCPATO_CARRY_DAYS", 720);
@@ -109,6 +114,142 @@ fn verdict(ann_return: f64, sharpe: f64, max_dd: f64) {
     println!("  exchange. El número real en vivo será algo menor.");
 }
 
+/// Carry multi-moneda: cobra funding en una cesta de perpetuos. Compara la cesta
+/// equiponderada y un top-k por funding reciente contra el carry de solo BTC.
+pub async fn run_multi(cfg: Config) -> Result<()> {
+    let days = env_u32("MCPATO_CARRY_DAYS", 720);
+    let universe: Vec<String> = std::env::var("MCPATO_CARRY_SYMBOLS")
+        .unwrap_or_else(|_| DEFAULT_UNIVERSE.to_string())
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let top_k = env_usize("MCPATO_CARRY_TOPK", 5);
+    let lookback = env_usize("MCPATO_CARRY_LOOKBACK", 3); // eventos (3 = 1 día)
+    let rebalance = env_usize("MCPATO_CARRY_REBALANCE", 3).max(1);
+    let commission = cfg.commission;
+
+    println!("\n=== CARRY MULTI-MONEDA · {} perps · {} días ===", universe.len(), days);
+    println!(
+        "Cesta delta-neutral cobrando funding. Top-{} por funding de las últimas {} ventanas, rebalanceo cada {} eventos.\n",
+        top_k, lookback, rebalance
+    );
+
+    let end = chrono::Utc::now();
+    let start = end - chrono::Duration::days(days as i64);
+    let (start_ms, end_ms) = (start.timestamp_millis(), end.timestamp_millis());
+
+    // Descarga funding de cada símbolo -> mapa fundingTime->rate.
+    let mut maps: Vec<(String, HashMap<i64, f64>)> = Vec::new();
+    let mut grid: Vec<i64> = Vec::new();
+    for sym in &universe {
+        match rest_binance::fetch_funding_rates(sym, start_ms, end_ms).await {
+            Ok(f) if f.len() >= 10 => {
+                for (t, _) in &f {
+                    grid.push(*t);
+                }
+                maps.push((sym.clone(), f.into_iter().collect()));
+            }
+            _ => eprintln!("  {sym:<10} sin funding, se omite"),
+        }
+    }
+    if maps.len() < top_k + 1 {
+        bail!("perps insuficientes con funding: {}", maps.len());
+    }
+    grid.sort_unstable();
+    grid.dedup();
+    let n = grid.len();
+
+    // Tasa alineada por símbolo (None si esa moneda no tenía funding en ese evento).
+    let aligned: Vec<Vec<Option<f64>>> = maps
+        .iter()
+        .map(|(_, m)| grid.iter().map(|t| m.get(t).copied()).collect())
+        .collect();
+
+    // Estrategia A: cesta equiponderada de TODAS las disponibles cada evento.
+    let mut eq_all = 1.0;
+    let mut curve_all = vec![1.0];
+    let mut rets_all = Vec::with_capacity(n);
+    for i in 0..n {
+        let rates: Vec<f64> = aligned.iter().filter_map(|c| c[i]).collect();
+        let r = if rates.is_empty() { 0.0 } else { rates.iter().sum::<f64>() / rates.len() as f64 };
+        eq_all *= 1.0 + r;
+        curve_all.push(eq_all);
+        rets_all.push(r);
+    }
+    eq_all *= 1.0 - 4.0 * commission; // entrada+salida, 2 patas
+
+    // Estrategia B: top-k por funding medio reciente, rebalanceado.
+    let mut eq_k = 1.0;
+    let mut curve_k = vec![1.0];
+    let mut rets_k = Vec::with_capacity(n);
+    let mut selected: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if i >= lookback && (i - lookback) % rebalance == 0 {
+            let mut scored: Vec<(usize, f64)> = Vec::new();
+            for (s, col) in aligned.iter().enumerate() {
+                let window: Vec<f64> = col[i - lookback..i].iter().filter_map(|x| *x).collect();
+                if !window.is_empty() {
+                    scored.push((s, window.iter().sum::<f64>() / window.len() as f64));
+                }
+            }
+            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let new_sel: Vec<usize> = scored.into_iter().take(top_k).map(|(s, _)| s).collect();
+            // Coste de rotar la cesta (fracción cambiada, 2 patas ida/vuelta).
+            if !selected.is_empty() {
+                let changed = new_sel.iter().filter(|s| !selected.contains(s)).count();
+                let frac = changed as f64 / top_k as f64;
+                eq_k *= 1.0 - frac * 4.0 * commission;
+            }
+            selected = new_sel;
+        }
+        let rates: Vec<f64> = selected.iter().filter_map(|&s| aligned[s][i]).collect();
+        let r = if rates.is_empty() { 0.0 } else { rates.iter().sum::<f64>() / rates.len() as f64 };
+        eq_k *= 1.0 + r;
+        curve_k.push(eq_k);
+        rets_k.push(r);
+    }
+    eq_k *= 1.0 - 4.0 * commission;
+
+    // BTC-only (referencia) desde su propia serie.
+    let btc_idx = maps.iter().position(|(s, _)| s == "BTCUSDT");
+    let (btc_ret, btc_sharpe, btc_dd) = if let Some(bi) = btc_idx {
+        let rates: Vec<f64> = aligned[bi].iter().filter_map(|x| *x).collect();
+        let mut e = 1.0;
+        let mut curve = vec![1.0];
+        for r in &rates {
+            e *= 1.0 + r;
+            curve.push(e);
+        }
+        e *= 1.0 - 4.0 * commission;
+        (e - 1.0, ann_sharpe_per_event(&rates, 3.0 * 365.0), max_drawdown(&curve))
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    let ann = |eq: f64| eq.powf(365.0 / days as f64) - 1.0;
+    println!("{:<26} retorno {:+6.1}%  anual {:+5.1}%  Sharpe {:+7.2}  maxDD {:.2}%",
+        "Cesta equiponderada", (eq_all - 1.0) * 100.0, ann(eq_all) * 100.0,
+        ann_sharpe_per_event(&rets_all, 3.0 * 365.0), max_drawdown(&curve_all) * 100.0);
+    println!("{:<26} retorno {:+6.1}%  anual {:+5.1}%  Sharpe {:+7.2}  maxDD {:.2}%",
+        format!("Top-{top_k} por funding"), (eq_k - 1.0) * 100.0, ann(eq_k) * 100.0,
+        ann_sharpe_per_event(&rets_k, 3.0 * 365.0), max_drawdown(&curve_k) * 100.0);
+    println!("{:<26} retorno {:+6.1}%  anual {:+5.1}%  Sharpe {:+7.2}  maxDD {:.2}%",
+        "Solo BTC", btc_ret * 100.0, ann(btc_ret + 1.0) * 100.0, btc_sharpe, btc_dd * 100.0);
+
+    println!("\nVeredicto:");
+    let best_basket = ann(eq_all).max(ann(eq_k));
+    if best_basket > ann(btc_ret + 1.0) * 1.1 {
+        println!("  Diversificar la cesta SUBE el yield frente a solo BTC ({:+.1}% vs {:+.1}%/año).",
+            best_basket * 100.0, ann(btc_ret + 1.0) * 100.0);
+        println!("  -> El carry multi-moneda es la base del bot de producción.");
+    } else {
+        println!("  La cesta no mejora claramente sobre solo BTC; BTC carry ya captura casi todo.");
+    }
+    println!("\n  (Mismo aviso: el backtest subestima basis risk, rebalanceo y riesgo de exchange.)");
+    Ok(())
+}
+
 /// Sharpe anualizado a partir de los retornos por evento (cada funding).
 fn ann_sharpe_per_event(rates: &[f64], events_per_year: f64) -> f64 {
     if rates.len() < 2 {
@@ -167,5 +308,9 @@ async fn btc_buy_hold(cfg: &Config, start_ms: i64, end_ms: i64) -> Option<(f64, 
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }

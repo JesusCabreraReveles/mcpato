@@ -50,6 +50,10 @@ async fn real_main() -> Result<()> {
     if std::env::var("MCPATO_CARRY_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
         return carry::run(cfg).await;
     }
+    // Modo experimento: carry multi-moneda (cesta de perps) y salida.
+    if std::env::var("MCPATO_CARRY_MULTI_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        return carry::run_multi(cfg).await;
+    }
 
     runtime::run(cfg).await
 }
