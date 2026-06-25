@@ -8,6 +8,7 @@ mod indicators;
 mod models;
 mod nn;
 mod notify;
+mod oos;
 mod rest_binance;
 mod runtime;
 mod signals;
@@ -29,6 +30,11 @@ async fn real_main() -> Result<()> {
     let cfg = Config::from_env()?;
 
     banner::print_startup(&cfg);
+
+    // Modo experimento: medición out-of-sample y salida (no arranca el daemon).
+    if std::env::var("MCPATO_OOS_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        return oos::run(cfg).await;
+    }
 
     runtime::run(cfg).await
 }

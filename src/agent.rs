@@ -9,6 +9,9 @@ use crate::{
 };
 
 const INITIAL_CAPITAL: f64 = 100.0;
+/// Igual que el límite del bucle en vivo (runtime.rs): suficiente para todos los
+/// indicadores y evita el coste cuadrático en simulaciones largas.
+const MAX_HISTORY: usize = 2000;
 
 /// Evalúa un genoma. Si `cfg.eval_windows > 1`, lo simula sobre varias
 /// sub-ventanas contiguas y promedia el resultado: reduce el sobreajuste de
@@ -69,6 +72,12 @@ fn simulate_window(
     for (idx, candle) in candles.iter().enumerate() {
         last_close = candle.close;
         history.push(candle.clone());
+        // Capa el historial igual que el bucle en vivo (runtime.rs), para que la
+        // simulación sea fiel y no degenere a O(n²) en ventanas largas.
+        if history.len() > MAX_HISTORY {
+            let drop_n = history.len() - MAX_HISTORY;
+            history.drain(0..drop_n);
+        }
         let features = compute_features(&history, &broker);
         let (signal, risk) = nn::forward(&genome, &features);
         let current_alloc = if broker.equity > 1e-12 {
