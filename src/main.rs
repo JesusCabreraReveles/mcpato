@@ -2,6 +2,7 @@ mod agent;
 mod banner;
 mod broker;
 mod config;
+mod crossmomentum;
 mod db;
 mod evolution;
 mod indicators;
@@ -39,6 +40,10 @@ async fn real_main() -> Result<()> {
     // Modo experimento: harness walk-forward multi-régimen y salida.
     if std::env::var("MCPATO_WF_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
         return walkforward::run(cfg).await;
+    }
+    // Modo experimento: sonda cross-sectional momentum (multi-moneda) y salida.
+    if std::env::var("MCPATO_XS_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        return crossmomentum::run(cfg).await;
     }
 
     runtime::run(cfg).await
