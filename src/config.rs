@@ -36,6 +36,12 @@ pub struct Config {
     pub seed: i64,
     pub pretrain_enabled: bool,
     pub pretrain_days: u32,
+    pub eval_windows: usize,
+    pub fit_w_alpha: f64,
+    pub fit_w_absolute: f64,
+    pub fit_w_sharpe: f64,
+    pub fit_w_dd: f64,
+    pub fit_death_penalty: f64,
 }
 
 impl Config {
@@ -79,6 +85,12 @@ impl Config {
             seed: chrono::Utc::now().timestamp(),
             pretrain_enabled: parse_or_default("MCPATO_PRETRAIN_ENABLED", false)?,
             pretrain_days: parse_or_default("MCPATO_PRETRAIN_DAYS", 90u32)?,
+            eval_windows: parse_or_default("MCPATO_EVAL_WINDOWS", 1usize)?.max(1),
+            fit_w_alpha: parse_or_default("MCPATO_FIT_W_ALPHA", 1.0)?,
+            fit_w_absolute: parse_or_default("MCPATO_FIT_W_ABSOLUTE", 0.3)?,
+            fit_w_sharpe: parse_or_default("MCPATO_FIT_W_SHARPE", 0.5)?,
+            fit_w_dd: parse_or_default("MCPATO_FIT_W_DD", 0.3)?,
+            fit_death_penalty: parse_or_default("MCPATO_FIT_DEATH_PENALTY", -1.0)?,
         })
     }
 }
@@ -122,6 +134,12 @@ impl Config {
             seed: 0,
             pretrain_enabled: false,
             pretrain_days: 90,
+            eval_windows: 1,
+            fit_w_alpha: 1.0,
+            fit_w_absolute: 0.3,
+            fit_w_sharpe: 0.5,
+            fit_w_dd: 0.3,
+            fit_death_penalty: -1.0,
         }
     }
 }

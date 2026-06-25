@@ -8,20 +8,66 @@ use crate::{
     nn,
 };
 
+const INITIAL_CAPITAL: f64 = 100.0;
+
+/// Evalúa un genoma. Si `cfg.eval_windows > 1`, lo simula sobre varias
+/// sub-ventanas contiguas y promedia el resultado: reduce el sobreajuste de
+/// medir sobre un único tramo (un campeón "ganador" de una ventana puede ser
+/// suerte). Con `eval_windows <= 1` equivale a una sola simulación.
 pub fn simulate_agent(
     genome: Genome,
     candles: &[Candle],
     cfg: &Config,
     generation_id: i64,
 ) -> EvalResult {
+    let windows = cfg.eval_windows.max(1);
+    let n = candles.len();
+
+    // Sin partición posible (pocas velas o una sola ventana): simulación directa.
+    if windows <= 1 || n < windows * 2 {
+        return simulate_window(genome, candles, cfg, generation_id);
+    }
+
+    let size = n / windows;
+    let mut results = Vec::with_capacity(windows);
+    for w in 0..windows {
+        let start = w * size;
+        let end = if w == windows - 1 { n } else { start + size };
+        results.push(simulate_window(
+            genome.clone(),
+            &candles[start..end],
+            cfg,
+            generation_id,
+        ));
+    }
+    aggregate_windows(genome, results)
+}
+
+/// Simula un genoma sobre un único tramo de velas y calcula su fitness.
+fn simulate_window(
+    genome: Genome,
+    candles: &[Candle],
+    cfg: &Config,
+    generation_id: i64,
+) -> EvalResult {
     let agent_id = Uuid::new_v4().to_string();
-    let mut broker = PaperBroker::new(100.0);
+    let mut broker = PaperBroker::new(INITIAL_CAPITAL);
     let mut history: Vec<Candle> = Vec::with_capacity(candles.len());
     let mut trades: Vec<TradeRecord> = Vec::new();
     let mut survived = true;
     let mut fee_counter = 0usize;
 
+    // Acumuladores para el Sharpe: media y desviación de los retornos por vela.
+    let mut prev_equity = INITIAL_CAPITAL;
+    let mut ret_sum = 0.0f64;
+    let mut ret_sumsq = 0.0f64;
+    let mut ret_n = 0u32;
+
+    let first_close = candles.first().map(|c| c.close).unwrap_or(0.0);
+    let mut last_close = first_close;
+
     for (idx, candle) in candles.iter().enumerate() {
+        last_close = candle.close;
         history.push(candle.clone());
         let features = compute_features(&history, &broker);
         let (signal, risk) = nn::forward(&genome, &features);
@@ -60,42 +106,47 @@ pub fn simulate_agent(
             fee_counter = 0;
             if !ok {
                 survived = false;
+                accumulate_return(&mut prev_equity, broker.equity, &mut ret_sum, &mut ret_sumsq, &mut ret_n);
                 return eval_result(
-                    agent_id,
-                    genome,
-                    broker,
-                    trades,
-                    idx + 1,
-                    candles.len(),
-                    survived,
+                    agent_id, genome, broker, trades, idx + 1, candles.len(), survived,
+                    first_close, last_close, ret_sum, ret_sumsq, ret_n, cfg,
                 );
             }
         }
 
         broker.update_equity(candle.close);
+        accumulate_return(&mut prev_equity, broker.equity, &mut ret_sum, &mut ret_sumsq, &mut ret_n);
+
         if broker.equity <= 1e-9 {
             survived = false;
             return eval_result(
-                agent_id,
-                genome,
-                broker,
-                trades,
-                idx + 1,
-                candles.len(),
-                survived,
+                agent_id, genome, broker, trades, idx + 1, candles.len(), survived,
+                first_close, last_close, ret_sum, ret_sumsq, ret_n, cfg,
             );
         }
     }
 
     eval_result(
-        agent_id,
-        genome,
-        broker,
-        trades,
-        candles.len(),
-        candles.len(),
-        survived,
+        agent_id, genome, broker, trades, candles.len(), candles.len(), survived,
+        first_close, last_close, ret_sum, ret_sumsq, ret_n, cfg,
     )
+}
+
+/// Acumula el log-retorno por vela del equity (para media/desviación → Sharpe).
+fn accumulate_return(
+    prev_equity: &mut f64,
+    equity: f64,
+    sum: &mut f64,
+    sumsq: &mut f64,
+    n: &mut u32,
+) {
+    if *prev_equity > 1e-12 && equity > 1e-12 {
+        let r = (equity / *prev_equity).ln();
+        *sum += r;
+        *sumsq += r * r;
+        *n += 1;
+    }
+    *prev_equity = equity;
 }
 
 fn signal_to_target_alloc(signal: f64, risk: f64, current_alloc: f64, threshold: f64) -> f64 {
@@ -108,6 +159,14 @@ fn signal_to_target_alloc(signal: f64, risk: f64, current_alloc: f64, threshold:
     }
 }
 
+/// Construye el `EvalResult` calculando el fitness rediseñado:
+/// - Si murió: fitness = penalización + un pequeño bonus por haber vivido más
+///   (morir tarde es menos malo que morir pronto). Así la supervivencia es un
+///   *filtro*, no un término que ahogue al resto.
+/// - Si sobrevivió: combinación ponderada (todos los pesos son configurables) de
+///   `alpha` (batir al buy&hold), retorno absoluto, Sharpe (consistencia) y un
+///   castigo al drawdown.
+#[allow(clippy::too_many_arguments)]
 fn eval_result(
     agent_id: String,
     genome: Genome,
@@ -116,10 +175,33 @@ fn eval_result(
     lived_candles: usize,
     total_candles: usize,
     survived: bool,
+    first_close: f64,
+    last_close: f64,
+    ret_sum: f64,
+    ret_sumsq: f64,
+    ret_n: u32,
+    cfg: &Config,
 ) -> EvalResult {
-    let survival_ratio = (lived_candles as f64 / total_candles as f64).clamp(0.0, 1.0);
-    let equity_growth = (broker.equity / 100.0).max(1e-9);
-    let fitness = 0.5 * survival_ratio + 0.4 * equity_growth.ln() - 0.1 * broker.max_drawdown;
+    let survival_ratio = (lived_candles as f64 / total_candles.max(1) as f64).clamp(0.0, 1.0);
+
+    let fitness = if !survived {
+        // Filtro: cualquier muerte queda por debajo de cualquier superviviente.
+        cfg.fit_death_penalty + 0.1 * survival_ratio
+    } else {
+        let agent_return = broker.equity / INITIAL_CAPITAL - 1.0;
+        let bench_return = if first_close > 0.0 {
+            last_close / first_close - 1.0
+        } else {
+            0.0
+        };
+        let alpha = agent_return - bench_return;
+        let sharpe = sharpe_ratio(ret_sum, ret_sumsq, ret_n);
+
+        cfg.fit_w_alpha * alpha
+            + cfg.fit_w_absolute * agent_return
+            + cfg.fit_w_sharpe * sharpe.tanh()
+            - cfg.fit_w_dd * broker.max_drawdown
+    };
 
     EvalResult {
         agent_id,
@@ -129,6 +211,56 @@ fn eval_result(
         max_drawdown: broker.max_drawdown,
         survival_ratio: if survived { 1.0 } else { survival_ratio },
         trades_count: broker.trades_count,
+        lived_candles,
+        trades,
+    }
+}
+
+/// Sharpe por vela = media / desviación de los log-retornos. Sin anualizar; el
+/// `tanh` posterior lo acota, así que solo importa como señal relativa entre
+/// genomas evaluados sobre la misma ventana.
+fn sharpe_ratio(sum: f64, sumsq: f64, n: u32) -> f64 {
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mean = sum / nf;
+    let var = (sumsq / nf - mean * mean).max(0.0);
+    let std = var.sqrt();
+    if std < 1e-12 {
+        0.0
+    } else {
+        mean / std
+    }
+}
+
+/// Promedia los resultados de varias sub-ventanas en un único `EvalResult`:
+/// fitness y equity como media, drawdown como el peor caso, trades concatenados.
+fn aggregate_windows(genome: Genome, results: Vec<EvalResult>) -> EvalResult {
+    let k = results.len().max(1) as f64;
+    let fitness = results.iter().map(|r| r.fitness).sum::<f64>() / k;
+    let equity_final = results.iter().map(|r| r.equity_final).sum::<f64>() / k;
+    let max_drawdown = results
+        .iter()
+        .map(|r| r.max_drawdown)
+        .fold(0.0f64, f64::max);
+    let survival_ratio = results.iter().map(|r| r.survival_ratio).sum::<f64>() / k;
+    let trades_count = results.iter().map(|r| r.trades_count).sum();
+    let lived_candles = results.iter().map(|r| r.lived_candles).sum();
+    let agent_id = results
+        .first()
+        .map(|r| r.agent_id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let trades = results.into_iter().flat_map(|r| r.trades).collect();
+
+    EvalResult {
+        agent_id,
+        genome,
+        fitness,
+        equity_final,
+        max_drawdown,
+        survival_ratio,
+        trades_count,
         lived_candles,
         trades,
     }
