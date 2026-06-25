@@ -1,6 +1,7 @@
 mod agent;
 mod banner;
 mod broker;
+mod carry;
 mod config;
 mod crossmomentum;
 mod db;
@@ -44,6 +45,10 @@ async fn real_main() -> Result<()> {
     // Modo experimento: sonda cross-sectional momentum (multi-moneda) y salida.
     if std::env::var("MCPATO_XS_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
         return crossmomentum::run(cfg).await;
+    }
+    // Modo experimento: sonda de carry (delta-neutral, cobra funding) y salida.
+    if std::env::var("MCPATO_CARRY_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        return carry::run(cfg).await;
     }
 
     runtime::run(cfg).await
