@@ -28,13 +28,25 @@ pub fn compute_features(history: &[Candle], broker: &PaperBroker) -> [f64; INPUT
         f[8] = clamp(atr(history, 14) / last_close, -3.0, 3.0);
     }
 
+    // Tendencia de horizonte largo: momentum a 50/100/200 velas y distancia a una
+    // EMA larga. Le dan al modelo contexto de la tendencia GRANDE (de qué carecía:
+    // por eso se perdía los mercados alcistas). Devuelven 0 si no hay histórico
+    // suficiente, así que degradan de forma neutral.
+    f[9] = clamp(ret_n(&closes, 50), -3.0, 3.0);
+    f[10] = clamp(ret_n(&closes, 100), -3.0, 3.0);
+    f[11] = clamp(ret_n(&closes, 200), -3.0, 3.0);
+    let ema_long = ema(&closes, 100);
+    if last_close > 0.0 {
+        f[12] = clamp((last_close - ema_long) / last_close, -3.0, 3.0);
+    }
+
     let equity = broker.equity.max(1e-12);
     let pos_val = broker.position_value(last_close);
     let unrealized = broker.unrealized_pnl(last_close);
 
-    f[9] = clamp(pos_val / equity, -3.0, 3.0);
-    f[10] = clamp(unrealized / equity, -3.0, 3.0);
-    f[11] = clamp(broker.max_drawdown, -3.0, 3.0);
+    f[13] = clamp(pos_val / equity, -3.0, 3.0);
+    f[14] = clamp(unrealized / equity, -3.0, 3.0);
+    f[15] = clamp(broker.max_drawdown, -3.0, 3.0);
 
     f
 }

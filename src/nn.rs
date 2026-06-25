@@ -2,7 +2,7 @@ use rand::Rng;
 
 use crate::models::Genome;
 
-pub const INPUT_SIZE: usize = 12;
+pub const INPUT_SIZE: usize = 16;
 pub const HIDDEN_SIZE: usize = 8;
 pub const OUTPUT_SIZE: usize = 2;
 pub const GENOME_LEN: usize =
