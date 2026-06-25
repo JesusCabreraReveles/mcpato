@@ -10,5 +10,6 @@
 - **[../DEPLOY.md](../DEPLOY.md)** — Despliegue del daemon en Raspberry Pi como
   servicio systemd (directorio, permisos, operación, backup).
 
-- **CARRY_BOT.md** *(pendiente)* — Diseño del bot de carry de producción, la
-  conclusión accionable de la bitácora de experimentos.
+- **[CARRY_BOT.md](./CARRY_BOT.md)** — Diseño y operación del bot de carry
+  (delta-neutral), la conclusión accionable de la bitácora: cómo funciona, sus
+  variables de entorno, expectativas honestas y siguientes pasos.
