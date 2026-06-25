@@ -11,12 +11,16 @@ use anyhow::{bail, Result};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::{
-    agent::simulate_agent,
+    agent::simulate_agent_warmup,
     config::Config,
     evolution,
     models::{Candle, Genome},
     rest_binance,
 };
+
+/// Velas de calentamiento antes de cada ventana, para que las features de
+/// horizonte largo (momentum 200, EMA 100) no salgan frías.
+const WARMUP: usize = 200;
 
 struct FoldReport {
     regime: &'static str,
@@ -91,10 +95,12 @@ pub async fn run(cfg: Config) -> Result<()> {
         let mut ret_acc = 0.0;
         let mut sharpe_acc = 0.0;
         let mut dd_acc = 0.0;
+        // Warm-up para la evaluación OOS: la cola del train, justo antes del test.
+        let oos_warmup = &candles[test_start.saturating_sub(WARMUP)..test_start];
         for seed in 1..=n_seeds {
             let mut rng = StdRng::seed_from_u64(seed + fold_idx as u64 * 1000);
             let champion = train_champion(&mut rng, train, &cfg);
-            let res = simulate_agent(champion, test, &cfg_eval, 0);
+            let res = simulate_agent_warmup(champion, oos_warmup, test, &cfg_eval, 0);
             ret_acc += res.equity_final / 100.0 - 1.0;
             sharpe_acc += res.sharpe;
             dd_acc += res.max_drawdown;
@@ -133,18 +139,22 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Entrena el motor evolutivo sobre `train` y devuelve el campeón final.
+/// Entrena el motor evolutivo sobre `train` (ventanas de `candles_per_day`, cada
+/// una precalentada con las velas previas) y devuelve el campeón final.
 fn train_champion(rng: &mut StdRng, train: &[Candle], cfg: &Config) -> Genome {
     let (mut champion, mut population) = evolution::bootstrap_population(rng, cfg);
+    let day = cfg.candles_per_day.max(1);
     let mut gen = 0i64;
-    for chunk in train.chunks(cfg.candles_per_day) {
-        if chunk.len() < cfg.candles_per_day {
-            break;
-        }
+    let mut start = 0usize;
+    while start + day <= train.len() {
+        let warmup = &train[start.saturating_sub(WARMUP)..start];
+        let scored = &train[start..start + day];
         gen += 1;
-        let outcome = evolution::evaluate_generation(rng, chunk, &population, cfg, gen);
+        let outcome =
+            evolution::evaluate_generation_warmup(rng, warmup, scored, &population, cfg, gen);
         champion = outcome.next_champion.clone();
         population = outcome.next_population;
+        start += day;
     }
     champion
 }

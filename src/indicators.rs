@@ -40,15 +40,91 @@ pub fn compute_features(history: &[Candle], broker: &PaperBroker) -> [f64; INPUT
         f[12] = clamp((last_close - ema_long) / last_close, -3.0, 3.0);
     }
 
+    // Volumen y posición en el rango: ¿el movimiento viene con volumen?, ¿estamos
+    // caros/baratos respecto a las bandas y al rango reciente? Aportan información
+    // independiente del puro momentum de precio.
+    f[13] = clamp(volume_zscore(history, 20), -3.0, 3.0);
+    f[14] = clamp(bollinger_b(&closes, 20), -3.0, 3.0);
+    f[15] = clamp(stochastic_k(history, 14), -3.0, 3.0);
+
     let equity = broker.equity.max(1e-12);
     let pos_val = broker.position_value(last_close);
     let unrealized = broker.unrealized_pnl(last_close);
 
-    f[13] = clamp(pos_val / equity, -3.0, 3.0);
-    f[14] = clamp(unrealized / equity, -3.0, 3.0);
-    f[15] = clamp(broker.max_drawdown, -3.0, 3.0);
+    f[16] = clamp(pos_val / equity, -3.0, 3.0);
+    f[17] = clamp(unrealized / equity, -3.0, 3.0);
+    f[18] = clamp(broker.max_drawdown, -3.0, 3.0);
 
     f
+}
+
+/// Media simple de los últimos `period` valores.
+fn sma(values: &[f64], period: usize) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let start = values.len().saturating_sub(period);
+    let slice = &values[start..];
+    slice.iter().sum::<f64>() / slice.len() as f64
+}
+
+/// Desviación estándar (poblacional) de los últimos `period` valores.
+fn stddev(values: &[f64], period: usize) -> f64 {
+    let start = values.len().saturating_sub(period);
+    let slice = &values[start..];
+    if slice.len() < 2 {
+        return 0.0;
+    }
+    let mean = slice.iter().sum::<f64>() / slice.len() as f64;
+    let var = slice.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / slice.len() as f64;
+    var.sqrt()
+}
+
+/// Z-score del volumen actual respecto a su media/desviación reciente.
+fn volume_zscore(history: &[Candle], period: usize) -> f64 {
+    if history.len() < 2 {
+        return 0.0;
+    }
+    let vols: Vec<f64> = history.iter().map(|c| c.volume).collect();
+    let mean = sma(&vols, period);
+    let std = stddev(&vols, period);
+    if std < 1e-12 {
+        0.0
+    } else {
+        (*vols.last().unwrap() - mean) / std
+    }
+}
+
+/// Bollinger %b centrado: 0 en la media, +1 en la banda superior (+2σ), -1 en la
+/// inferior. Indica si el precio está caro/barato respecto a su rango estadístico.
+fn bollinger_b(closes: &[f64], period: usize) -> f64 {
+    if closes.len() < period {
+        return 0.0;
+    }
+    let mid = sma(closes, period);
+    let std = stddev(closes, period);
+    if std < 1e-12 {
+        return 0.0;
+    }
+    (closes.last().unwrap() - mid) / (2.0 * std)
+}
+
+/// Estocástico %K centrado a [-1, 1]: posición del cierre dentro del rango
+/// máximo-mínimo de las últimas `period` velas.
+fn stochastic_k(history: &[Candle], period: usize) -> f64 {
+    if history.len() < 2 {
+        return 0.0;
+    }
+    let start = history.len().saturating_sub(period);
+    let slice = &history[start..];
+    let max_high = slice.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+    let min_low = slice.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+    let range = max_high - min_low;
+    if range < 1e-12 {
+        return 0.0;
+    }
+    let close = slice.last().unwrap().close;
+    2.0 * (close - min_low) / range - 1.0
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {

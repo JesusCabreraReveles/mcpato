@@ -23,12 +23,26 @@ pub fn simulate_agent(
     cfg: &Config,
     generation_id: i64,
 ) -> EvalResult {
+    simulate_agent_warmup(genome, &[], candles, cfg, generation_id)
+}
+
+/// Igual que `simulate_agent` pero con un prefijo de `warmup` que precalienta los
+/// indicadores (no se opera ni puntúa sobre él): imprescindible para que las
+/// features de horizonte largo (momentum 200, EMA larga) tengan contexto desde la
+/// primera vela puntuada en vez de salir "frías".
+pub fn simulate_agent_warmup(
+    genome: Genome,
+    warmup: &[Candle],
+    scored: &[Candle],
+    cfg: &Config,
+    generation_id: i64,
+) -> EvalResult {
     let windows = cfg.eval_windows.max(1);
-    let n = candles.len();
+    let n = scored.len();
 
     // Sin partición posible (pocas velas o una sola ventana): simulación directa.
     if windows <= 1 || n < windows * 2 {
-        return simulate_window(genome, candles, cfg, generation_id);
+        return simulate_window(genome, warmup, scored, cfg, generation_id);
     }
 
     let size = n / windows;
@@ -36,9 +50,14 @@ pub fn simulate_agent(
     for w in 0..windows {
         let start = w * size;
         let end = if w == windows - 1 { n } else { start + size };
+        // El warm-up de cada sub-ventana = el global + las velas puntuadas previas.
+        let mut wu: Vec<Candle> = Vec::with_capacity(warmup.len() + start);
+        wu.extend_from_slice(warmup);
+        wu.extend_from_slice(&scored[..start]);
         results.push(simulate_window(
             genome.clone(),
-            &candles[start..end],
+            &wu,
+            &scored[start..end],
             cfg,
             generation_id,
         ));
@@ -46,16 +65,23 @@ pub fn simulate_agent(
     aggregate_windows(genome, results)
 }
 
-/// Simula un genoma sobre un único tramo de velas y calcula su fitness.
+/// Simula un genoma sobre un único tramo `scored`, con `warmup` para precalentar
+/// los indicadores (sin operar ni puntuar sobre él), y calcula su fitness.
 fn simulate_window(
     genome: Genome,
-    candles: &[Candle],
+    warmup: &[Candle],
+    scored: &[Candle],
     cfg: &Config,
     generation_id: i64,
 ) -> EvalResult {
+    let candles = scored;
     let agent_id = Uuid::new_v4().to_string();
     let mut broker = PaperBroker::new(INITIAL_CAPITAL);
-    let mut history: Vec<Candle> = Vec::with_capacity(candles.len());
+    let mut history: Vec<Candle> = warmup.to_vec();
+    if history.len() > MAX_HISTORY {
+        let drop_n = history.len() - MAX_HISTORY;
+        history.drain(0..drop_n);
+    }
     let mut trades: Vec<TradeRecord> = Vec::new();
     let mut survived = true;
     let mut fee_counter = 0usize;

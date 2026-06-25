@@ -1,7 +1,7 @@
 use rand::{distributions::WeightedIndex, prelude::Distribution, Rng};
 
 use crate::{
-    agent::simulate_agent,
+    agent::simulate_agent_warmup,
     config::Config,
     models::{Candle, EvalResult, Genome},
     nn,
@@ -24,10 +24,24 @@ pub fn evaluate_generation<R: Rng>(
     cfg: &Config,
     generation_id: i64,
 ) -> GenerationOutcome {
+    evaluate_generation_warmup(rng, &[], candles, population, cfg, generation_id)
+}
+
+/// Igual que `evaluate_generation` pero con un prefijo `warmup` para precalentar
+/// los indicadores de cada agente (lo usa el harness/pre-entrenamiento; el bucle
+/// en vivo usa la versión sin warm-up).
+pub fn evaluate_generation_warmup<R: Rng>(
+    rng: &mut R,
+    warmup: &[Candle],
+    scored: &[Candle],
+    population: &[Genome],
+    cfg: &Config,
+    generation_id: i64,
+) -> GenerationOutcome {
     let mut results: Vec<EvalResult> = population
         .iter()
         .cloned()
-        .map(|g| simulate_agent(g, candles, cfg, generation_id))
+        .map(|g| simulate_agent_warmup(g, warmup, scored, cfg, generation_id))
         .collect();
 
     results.sort_by(|a, b| b.fitness.total_cmp(&a.fitness));
