@@ -54,6 +54,22 @@ pub async fn run(cfg: Config) -> Result<()> {
         PaperBroker::new(cfg.initial_capital)
     };
 
+    // Pre-entrenamiento offline (opcional, apagado por defecto): reproduce meses
+    // de histórico en muchas generaciones de golpe para que el campeón arranque
+    // ya afinado, en vez de esperar ~1 generación por día en vivo. Solo corre si
+    // está activado Y la BD aún no tiene generaciones (idempotente: un reinicio
+    // del servicio no re-entrena ni infla la BD).
+    if cfg.pretrain_enabled {
+        let existing = db.load_generation_count().await?;
+        if existing > 0 {
+            println!(
+                "Pre-entrenamiento: omitido (la BD ya tiene {existing} generaciones)"
+            );
+        } else if let Err(e) = pretrain(&db, &cfg, &mut rng).await {
+            eprintln!("warn: pre-entrenamiento falló (se continúa sin él): {e:#}");
+        }
+    }
+
     // Backfill histórico: descarga velas recientes desde la API REST para
     // "calentar" indicadores/equity y disparar una generación temprana sin
     // esperar a que cierren velas en vivo. Si falla, se continúa sin él.
@@ -347,6 +363,94 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     })
     .await
+}
+
+/// Pre-entrenamiento offline: descarga `cfg.pretrain_days` días de histórico de
+/// Binance y los reproduce en generaciones consecutivas (ventanas de
+/// `cfg.candles_per_day` velas), arrastrando la población igual que el bucle en
+/// vivo. Persiste cada generación y sus agentes para que el flujo normal cargue
+/// el campeón resultante. No persiste los trades sintéticos de cada agente (no
+/// aportan y solo inflarían la BD).
+async fn pretrain(db: &Database, cfg: &Config, rng: &mut StdRng) -> Result<()> {
+    let end = chrono::Utc::now();
+    let start = end - chrono::Duration::days(cfg.pretrain_days.max(1) as i64);
+
+    println!(
+        "Pre-entrenamiento: descargando {} días de histórico ({} {})...",
+        cfg.pretrain_days, cfg.symbol, cfg.interval
+    );
+    let candles = rest_binance::fetch_klines_range(
+        &cfg.symbol,
+        &cfg.interval,
+        start.timestamp_millis(),
+        end.timestamp_millis(),
+    )
+    .await?;
+
+    if candles.len() < cfg.candles_per_day {
+        eprintln!(
+            "warn: pre-entrenamiento: histórico insuficiente ({} velas, se necesitan {}); se omite",
+            candles.len(),
+            cfg.candles_per_day
+        );
+        return Ok(());
+    }
+
+    // Persiste las velas descargadas (INSERT OR IGNORE deduplica por timestamp).
+    for c in &candles {
+        db.insert_candle(c).await?;
+    }
+
+    let (_champion, mut population) = evolution::bootstrap_population(rng, cfg);
+    let mut generation_counter: i64 = 0;
+
+    for chunk in candles.chunks(cfg.candles_per_day) {
+        // Ignora la última ventana parcial.
+        if chunk.len() < cfg.candles_per_day {
+            break;
+        }
+
+        let pseudo_generation_id = generation_counter + 1;
+        let outcome =
+            evolution::evaluate_generation(rng, chunk, &population, cfg, pseudo_generation_id);
+
+        let day_start = chunk.first().map(|c| c.ts).unwrap_or(start);
+        let day_end = chunk.last().map(|c| c.ts).unwrap_or(end);
+        let champ_equity = outcome
+            .results
+            .first()
+            .map(|r| r.equity_final)
+            .unwrap_or(cfg.initial_capital);
+
+        let generation_id = db
+            .insert_generation(
+                day_start,
+                day_end,
+                outcome.avg_fitness,
+                outcome.best_fitness,
+                outcome.survival_rate,
+                outcome.extinction_happened,
+                champ_equity,
+                champ_equity - cfg.initial_capital,
+                cfg.seed,
+            )
+            .await?;
+
+        for result in &outcome.results {
+            db.insert_agent_result(generation_id, result).await?;
+        }
+
+        population = outcome.next_population;
+        generation_counter += 1;
+    }
+
+    println!(
+        "Pre-entrenamiento: {} generaciones evaluadas sobre {} velas ({} días). Campeón listo.",
+        generation_counter,
+        candles.len(),
+        cfg.pretrain_days
+    );
+    Ok(())
 }
 
 /// Envía por Telegram las señales pendientes no notificadas. Los errores de red

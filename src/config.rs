@@ -34,6 +34,8 @@ pub struct Config {
     pub candles_per_day: usize,
     pub survival_fee_cadence_candles: usize,
     pub seed: i64,
+    pub pretrain_enabled: bool,
+    pub pretrain_days: u32,
 }
 
 impl Config {
@@ -71,10 +73,12 @@ impl Config {
             backfill_enabled: parse_or_default("MCPATO_BACKFILL_ENABLED", true)?,
             backfill_limit: parse_or_default("MCPATO_BACKFILL_LIMIT", 300u32)?,
             max_generations: parse_optional("MCPATO_MAX_GENERATIONS")?,
-            population_size: 10,
-            candles_per_day: 288,
+            population_size: parse_or_default("MCPATO_POPULATION_SIZE", 10usize)?.max(2),
+            candles_per_day: parse_or_default("MCPATO_CANDLES_PER_DAY", 288usize)?.max(1),
             survival_fee_cadence_candles: 144,
             seed: chrono::Utc::now().timestamp(),
+            pretrain_enabled: parse_or_default("MCPATO_PRETRAIN_ENABLED", false)?,
+            pretrain_days: parse_or_default("MCPATO_PRETRAIN_DAYS", 90u32)?,
         })
     }
 }
@@ -116,6 +120,8 @@ impl Config {
             candles_per_day: 288,
             survival_fee_cadence_candles: 144,
             seed: 0,
+            pretrain_enabled: false,
+            pretrain_days: 90,
         }
     }
 }
