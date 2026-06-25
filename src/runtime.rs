@@ -113,6 +113,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     // espuria en la primera vela tras un reinicio).
     let stance = signals::stance_from_position(broker.position_qty, cfg.position_epsilon);
 
+    // Última vela ya cargada: marca la frontera para el resync por REST al
+    // (re)conectar, de modo que no se reprocese el histórico ya en memoria.
+    let initial_last_ts = historical.last().map(|c| c.ts);
+
     let state = Arc::new(Mutex::new(RuntimeState {
         broker,
         historical,
@@ -146,7 +150,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         println!("Dashboard web: desactivado (MCPATO_HTTP_ENABLED=false)");
     }
 
-    ws_binance::run_kline_stream(&cfg.symbol, &cfg.interval, {
+    ws_binance::run_kline_stream(&cfg.symbol, &cfg.interval, initial_last_ts, {
         let db = db.clone();
         let cfg = cfg.clone();
         let state = Arc::clone(&state);
