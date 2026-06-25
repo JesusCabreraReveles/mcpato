@@ -9,10 +9,12 @@
 //! MCPATO_CARRY_CHECK.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
+use tokio::time::sleep;
 
-use crate::{config::Config, rest_binance};
+use crate::{config::Config, db::Database, models::CarryState, notify::Notifier, rest_binance};
 
 const DEFAULT_UNIVERSE: &str = "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,SOLUSDT,\
 DOGEUSDT,LTCUSDT,LINKUSDT,DOTUSDT,AVAXUSDT,TRXUSDT,ATOMUSDT,ETCUSDT,BCHUSDT,XLMUSDT";
@@ -112,6 +114,100 @@ fn verdict(ann_return: f64, sharpe: f64, max_dd: f64) {
     println!("\n  Aviso honesto: un backtest de carry SUBESTIMA riesgos reales — apalancamiento");
     println!("  /liquidación de la pata corta, coste de rebalancear el hedge, y riesgo de");
     println!("  exchange. El número real en vivo será algo menor.");
+}
+
+/// Bot de carry de PRODUCCIÓN (paper, paso 1). Mantiene una posición
+/// delta-neutral (long spot + short perp, 1x por defecto) y acumula el funding
+/// real de cada liquidación (cada 8h) contra datos en vivo de Binance. El estado
+/// se persiste, así que sobrevive a reinicios. Robusto a cortes de red: el
+/// funding se lee por REST y se reintenta en el siguiente ciclo.
+///
+/// Pendiente (pasos 2-3): control de riesgo (salir si el funding se vuelve
+/// persistentemente negativo), rebalanceo del hedge, y dashboard.
+pub async fn run_bot(cfg: Config) -> Result<()> {
+    let db = Database::connect(&cfg.db_path).await?;
+    db.init().await?;
+
+    let leverage = env_f64("MCPATO_CARRY_LEVERAGE", 1.0).clamp(0.1, 10.0);
+    let poll_secs = env_u32("MCPATO_CARRY_POLL_SECS", 300).max(10) as u64;
+    let commission = cfg.commission;
+    let notifier = Notifier::from_config(&cfg);
+
+    let mut state = match db.load_carry_state().await? {
+        Some(s) => {
+            println!(
+                "Carry: estado recuperado · equity {:.4} · funding acumulado {:+.4} · {} pagos",
+                s.equity, s.accumulated_funding, s.payments
+            );
+            s
+        }
+        None => {
+            // Abre la posición delta-neutral: coste de entrada de 2 patas.
+            let equity = cfg.initial_capital * (1.0 - 2.0 * commission);
+            let s = CarryState {
+                equity,
+                initial_capital: cfg.initial_capital,
+                accumulated_funding: 0.0,
+                last_settled_ms: chrono::Utc::now().timestamp_millis(),
+                position_open: true,
+                payments: 0,
+            };
+            db.upsert_carry_state(&s).await?;
+            println!(
+                "Carry: posición delta-neutral ABIERTA · capital {:.2} · leverage {}x · símbolo {}",
+                equity, leverage, cfg.symbol
+            );
+            let _ = notifier
+                .send_text(&format!(
+                    "🟢 Carry abierto\nSímbolo: {}\nCapital: {:.2}\nLeverage: {}x (delta-neutral)",
+                    cfg.symbol, equity, leverage
+                ))
+                .await;
+            s
+        }
+    };
+
+    println!(
+        "Carry bot en marcha (poll cada {}s). Notificaciones Telegram: {}.",
+        poll_secs,
+        if notifier.is_enabled() { "ON" } else { "off" }
+    );
+
+    loop {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match rest_binance::fetch_funding_rates(&cfg.symbol, state.last_settled_ms + 1, now_ms).await
+        {
+            Ok(funding) => {
+                let mut new_payments = 0;
+                for (t, rate) in funding {
+                    if t <= state.last_settled_ms {
+                        continue;
+                    }
+                    // Cobro de la pata corta: +rate * notional (notional = equity*leverage).
+                    let notional = state.equity * leverage;
+                    let payment = rate * notional;
+                    state.equity += payment;
+                    state.accumulated_funding += payment;
+                    state.last_settled_ms = t;
+                    state.payments += 1;
+                    new_payments += 1;
+                    println!(
+                        "Carry funding · rate {:+.5}% · pago {:+.4} · equity {:.4} (Δ {:+.4})",
+                        rate * 100.0,
+                        payment,
+                        state.equity,
+                        state.equity - state.initial_capital
+                    );
+                }
+                if new_payments > 0 {
+                    db.upsert_carry_state(&state).await?;
+                }
+            }
+            Err(e) => eprintln!("warn: lectura de funding falló (se reintenta): {e:#}"),
+        }
+
+        sleep(Duration::from_secs(poll_secs)).await;
+    }
 }
 
 /// Carry multi-moneda: cobra funding en una cesta de perpetuos. Compara la cesta
@@ -312,5 +408,9 @@ fn env_u32(key: &str, default: u32) -> u32 {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }

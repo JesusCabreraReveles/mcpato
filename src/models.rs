@@ -14,6 +14,17 @@ pub struct Candle {
     pub funding_rate: f64,
 }
 
+/// Estado persistente del bot de carry (delta-neutral, paper). Una sola fila.
+#[derive(Debug, Clone)]
+pub struct CarryState {
+    pub equity: f64,
+    pub initial_capital: f64,
+    pub accumulated_funding: f64,
+    pub last_settled_ms: i64,
+    pub position_open: bool,
+    pub payments: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct OrganismState {
     pub cash: f64,

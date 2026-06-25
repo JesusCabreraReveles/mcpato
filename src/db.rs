@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Row, Sqlite};
 
-use crate::models::{Candle, EvalResult, Genome, OrganismState, Signal, TradeRecord};
+use crate::models::{Candle, CarryState, EvalResult, Genome, OrganismState, Signal, TradeRecord};
 use crate::signals::STATUS_PENDING;
 
 #[derive(Clone)]
@@ -54,6 +54,21 @@ impl Database {
                 initial_capital REAL NOT NULL,
                 delta_vs_initial REAL NOT NULL,
                 alive INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS carry_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                updated_at TEXT NOT NULL,
+                equity REAL NOT NULL,
+                initial_capital REAL NOT NULL,
+                accumulated_funding REAL NOT NULL,
+                last_settled_ms INTEGER NOT NULL,
+                position_open INTEGER NOT NULL,
+                payments INTEGER NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -192,6 +207,50 @@ impl Database {
         .bind(state.initial_capital)
         .bind(state.delta_vs_initial)
         .bind(if state.alive { 1i64 } else { 0i64 })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_carry_state(&self) -> Result<Option<CarryState>> {
+        let row = sqlx::query(
+            "SELECT equity, initial_capital, accumulated_funding, last_settled_ms, position_open, payments
+             FROM carry_state WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| CarryState {
+            equity: r.get::<f64, _>("equity"),
+            initial_capital: r.get::<f64, _>("initial_capital"),
+            accumulated_funding: r.get::<f64, _>("accumulated_funding"),
+            last_settled_ms: r.get::<i64, _>("last_settled_ms"),
+            position_open: r.get::<i64, _>("position_open") != 0,
+            payments: r.get::<i64, _>("payments"),
+        }))
+    }
+
+    pub async fn upsert_carry_state(&self, state: &CarryState) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO carry_state(
+                id, updated_at, equity, initial_capital, accumulated_funding, last_settled_ms, position_open, payments
+             ) VALUES(1, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                equity=excluded.equity,
+                initial_capital=excluded.initial_capital,
+                accumulated_funding=excluded.accumulated_funding,
+                last_settled_ms=excluded.last_settled_ms,
+                position_open=excluded.position_open,
+                payments=excluded.payments",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(state.equity)
+        .bind(state.initial_capital)
+        .bind(state.accumulated_funding)
+        .bind(state.last_settled_ms)
+        .bind(if state.position_open { 1i64 } else { 0i64 })
+        .bind(state.payments)
         .execute(&self.pool)
         .await?;
         Ok(())

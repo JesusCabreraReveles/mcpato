@@ -47,19 +47,23 @@ impl Notifier {
     /// Envía la señal por Telegram. Devuelve `Ok(())` si se entregó; `Err` si
     /// falló (el caller decide solo loguear, sin propagar el error al daemon).
     pub async fn send_signal(&self, signal: &Signal) -> anyhow::Result<()> {
+        self.send_text(&format_signal_message(signal)).await
+    }
+
+    /// Envía un mensaje de texto arbitrario (HTML). No-op si está desactivado.
+    pub async fn send_text(&self, text: &str) -> anyhow::Result<()> {
         if !self.enabled {
             return Ok(());
         }
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        let text = format_signal_message(signal);
 
         let resp = self
             .client
             .post(&url)
             .form(&[
                 ("chat_id", self.chat_id.as_str()),
-                ("text", text.as_str()),
+                ("text", text),
                 ("parse_mode", "HTML"),
                 ("disable_web_page_preview", "true"),
             ])
