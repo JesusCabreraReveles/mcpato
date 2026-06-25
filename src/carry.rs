@@ -8,13 +8,15 @@
 //! así que se cobra el funding sobre el capital completo. Gated por
 //! MCPATO_CARRY_CHECK.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use tokio::time::sleep;
 
-use crate::{config::Config, db::Database, models::CarryState, notify::Notifier, rest_binance};
+use crate::{config::Config, db::Database, models::CarryState, notify::Notifier, rest_binance, web};
+
+const FUNDING_INTERVAL_MS: i64 = 8 * 60 * 60 * 1000; // 8h
 
 const DEFAULT_UNIVERSE: &str = "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,ADAUSDT,SOLUSDT,\
 DOGEUSDT,LTCUSDT,LINKUSDT,DOTUSDT,AVAXUSDT,TRXUSDT,ATOMUSDT,ETCUSDT,BCHUSDT,XLMUSDT";
@@ -116,39 +118,54 @@ fn verdict(ann_return: f64, sharpe: f64, max_dd: f64) {
     println!("  exchange. El número real en vivo será algo menor.");
 }
 
-/// Bot de carry de PRODUCCIÓN (paper, paso 1). Mantiene una posición
-/// delta-neutral (long spot + short perp, 1x por defecto) y acumula el funding
-/// real de cada liquidación (cada 8h) contra datos en vivo de Binance. El estado
-/// se persiste, así que sobrevive a reinicios. Robusto a cortes de red: el
-/// funding se lee por REST y se reintenta en el siguiente ciclo.
-///
-/// Pendiente (pasos 2-3): control de riesgo (salir si el funding se vuelve
-/// persistentemente negativo), rebalanceo del hedge, y dashboard.
+/// Bot de carry de PRODUCCIÓN (paper). Mantiene una posición delta-neutral
+/// (long spot + short perp, 1x por defecto), acumula el funding real de cada
+/// liquidación de 8h, y aplica control de riesgo: si el funding medio reciente se
+/// vuelve negativo se aplana a cash, y re-entra cuando recupera. Estado
+/// persistido (sobrevive reinicios), dashboard web y resumen diario por Telegram.
+/// Robusto a cortes de red (REST con reintento).
 pub async fn run_bot(cfg: Config) -> Result<()> {
     let db = Database::connect(&cfg.db_path).await?;
     db.init().await?;
 
     let leverage = env_f64("MCPATO_CARRY_LEVERAGE", 1.0).clamp(0.1, 10.0);
     let poll_secs = env_u32("MCPATO_CARRY_POLL_SECS", 300).max(10) as u64;
+    // Ventana e histéresis: reacciona a REGÍMENES de funding negativo, no a prints
+    // sueltos (evita churn: cada salida+entrada cuesta ~0.4%, que en periodos flojos
+    // se comería el funding). exit_thr < entry_thr crea una banda muerta alrededor
+    // del cero.
+    let neg_window = env_usize("MCPATO_CARRY_NEG_WINDOW", 9).max(1); // liquidaciones (9 = 3 días)
+    let exit_thr = env_f64("MCPATO_CARRY_EXIT_THR", -0.00005);
+    let entry_thr = env_f64("MCPATO_CARRY_ENTRY_THR", 0.00005);
     let commission = cfg.commission;
     let notifier = Notifier::from_config(&cfg);
+
+    // Semilla de la ventana de funding reciente (para la media móvil del riesgo).
+    let mut window: VecDeque<f64> = VecDeque::with_capacity(neg_window);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let seed_from = now_ms - (neg_window as i64 + 2) * FUNDING_INTERVAL_MS;
+    if let Ok(hist) = rest_binance::fetch_funding_rates(&cfg.symbol, seed_from, now_ms).await {
+        for (_, r) in hist.iter().rev().take(neg_window) {
+            window.push_front(*r);
+        }
+    }
 
     let mut state = match db.load_carry_state().await? {
         Some(s) => {
             println!(
-                "Carry: estado recuperado · equity {:.4} · funding acumulado {:+.4} · {} pagos",
-                s.equity, s.accumulated_funding, s.payments
+                "Carry: estado recuperado · equity {:.4} · funding acumulado {:+.4} · {} pagos · {}",
+                s.equity, s.accumulated_funding, s.payments,
+                if s.position_open { "ABIERTA" } else { "EN CASH" }
             );
             s
         }
         None => {
-            // Abre la posición delta-neutral: coste de entrada de 2 patas.
             let equity = cfg.initial_capital * (1.0 - 2.0 * commission);
             let s = CarryState {
                 equity,
                 initial_capital: cfg.initial_capital,
                 accumulated_funding: 0.0,
-                last_settled_ms: chrono::Utc::now().timestamp_millis(),
+                last_settled_ms: now_ms,
                 position_open: true,
                 payments: 0,
             };
@@ -167,47 +184,112 @@ pub async fn run_bot(cfg: Config) -> Result<()> {
         }
     };
 
+    // Dashboard web del carry en tarea aparte (no tumba el bot si no puede bindear).
+    if cfg.http_enabled {
+        let web_cfg = cfg.clone();
+        let web_db = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = web::serve_carry(web_cfg, web_db).await {
+                eprintln!("warn: dashboard de carry detenido: {e:#}");
+            }
+        });
+    }
+
     println!(
-        "Carry bot en marcha (poll cada {}s). Notificaciones Telegram: {}.",
+        "Carry bot en marcha (poll cada {}s · ventana riesgo {} liquidaciones). Telegram: {}.",
         poll_secs,
+        neg_window,
         if notifier.is_enabled() { "ON" } else { "off" }
     );
+
+    let mut last_summary = chrono::Utc::now();
 
     loop {
         let now_ms = chrono::Utc::now().timestamp_millis();
         match rest_binance::fetch_funding_rates(&cfg.symbol, state.last_settled_ms + 1, now_ms).await
         {
             Ok(funding) => {
-                let mut new_payments = 0;
+                let mut changed = false;
                 for (t, rate) in funding {
                     if t <= state.last_settled_ms {
                         continue;
                     }
-                    // Cobro de la pata corta: +rate * notional (notional = equity*leverage).
-                    let notional = state.equity * leverage;
-                    let payment = rate * notional;
-                    state.equity += payment;
-                    state.accumulated_funding += payment;
+                    window.push_back(rate);
+                    while window.len() > neg_window {
+                        window.pop_front();
+                    }
                     state.last_settled_ms = t;
-                    state.payments += 1;
-                    new_payments += 1;
-                    println!(
-                        "Carry funding · rate {:+.5}% · pago {:+.4} · equity {:.4} (Δ {:+.4})",
-                        rate * 100.0,
-                        payment,
-                        state.equity,
-                        state.equity - state.initial_capital
-                    );
+                    changed = true;
+
+                    // Cobra funding solo si la posición está abierta.
+                    if state.position_open {
+                        let notional = state.equity * leverage;
+                        let payment = rate * notional;
+                        state.equity += payment;
+                        state.accumulated_funding += payment;
+                        state.payments += 1;
+                        println!(
+                            "Carry funding · rate {:+.5}% · pago {:+.4} · equity {:.4} (Δ {:+.4})",
+                            rate * 100.0, payment, state.equity, state.equity - state.initial_capital
+                        );
+                    }
+
+                    // Control de riesgo según la media móvil del funding.
+                    let avg = window.iter().sum::<f64>() / window.len() as f64;
+                    if state.position_open && avg < exit_thr {
+                        state.equity *= 1.0 - 2.0 * commission; // coste de salida
+                        state.position_open = false;
+                        let msg = format!(
+                            "🔴 Carry → CASH\nFunding medio {:+.5}% < umbral. Se cierra el hedge.\nEquity: {:.2}",
+                            avg * 100.0, state.equity
+                        );
+                        println!("{msg}");
+                        let _ = notifier.send_text(&msg).await;
+                    } else if !state.position_open && avg >= entry_thr && window.len() >= neg_window {
+                        state.equity *= 1.0 - 2.0 * commission; // coste de entrada
+                        state.position_open = true;
+                        let msg = format!(
+                            "🟢 Carry → RE-ABIERTO\nFunding medio {:+.5}% recuperado. Hedge de vuelta.\nEquity: {:.2}",
+                            avg * 100.0, state.equity
+                        );
+                        println!("{msg}");
+                        let _ = notifier.send_text(&msg).await;
+                    }
                 }
-                if new_payments > 0 {
+                if changed {
                     db.upsert_carry_state(&state).await?;
                 }
             }
             Err(e) => eprintln!("warn: lectura de funding falló (se reintenta): {e:#}"),
         }
 
+        // Resumen diario por Telegram.
+        if (chrono::Utc::now() - last_summary).num_hours() >= 24 {
+            let _ = notifier.send_text(&daily_summary(&state)).await;
+            last_summary = chrono::Utc::now();
+        }
+
         sleep(Duration::from_secs(poll_secs)).await;
     }
+}
+
+/// Texto del resumen diario.
+fn daily_summary(s: &CarryState) -> String {
+    let days = s.payments as f64 / 3.0;
+    let ann = if days > 0.5 && s.initial_capital > 0.0 {
+        Some((s.equity / s.initial_capital).powf(365.0 / days) - 1.0)
+    } else {
+        None
+    };
+    format!(
+        "📊 Carry · resumen diario\nEquity: {:.2} (Δ {:+.2})\nFunding acumulado: {:+.2}\nPagos: {}\nPosición: {}\nRetorno anualizado est.: {}",
+        s.equity,
+        s.equity - s.initial_capital,
+        s.accumulated_funding,
+        s.payments,
+        if s.position_open { "ABIERTA" } else { "EN CASH" },
+        ann.map(|a| format!("{:+.1}%", a * 100.0)).unwrap_or_else(|| "—".to_string()),
+    )
 }
 
 /// Carry multi-moneda: cobra funding en una cesta de perpetuos. Compara la cesta

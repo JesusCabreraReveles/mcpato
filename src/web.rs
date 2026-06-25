@@ -144,6 +144,129 @@ async fn api_execute(
     Ok(Json(ExecResult { ok: true, changed }))
 }
 
+// ----------------------------------------------------------------------------
+// Dashboard del bot de carry (servidor aparte, reusa el patrón de arriba).
+// ----------------------------------------------------------------------------
+
+const CARRY_HTML: &str = r#"<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mcPato · Carry</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:2rem;}
+ h1{font-weight:600;font-size:1.4rem} .muted{color:#8b949e}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:1.5rem;max-width:760px}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1rem 1.2rem}
+ .card .lbl{color:#8b949e;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}
+ .card .val{font-size:1.6rem;font-weight:600;margin-top:.3rem}
+ .pos{color:#3fb950}.neg{color:#f85149}
+ .pill{display:inline-block;padding:.2rem .7rem;border-radius:999px;font-size:.85rem}
+ .open{background:#1a3326;color:#3fb950}.flat{background:#3a2a1a;color:#e3b341}
+</style></head><body>
+<h1>🦆 mcPato · Carry <span class="muted" id="sym"></span></h1>
+<div id="state" class="muted">cargando…</div>
+<div class="grid">
+ <div class="card"><div class="lbl">Equity</div><div class="val" id="eq">—</div></div>
+ <div class="card"><div class="lbl">Δ vs inicial</div><div class="val" id="delta">—</div></div>
+ <div class="card"><div class="lbl">Funding acumulado</div><div class="val" id="fund">—</div></div>
+ <div class="card"><div class="lbl">Retorno anualizado (est.)</div><div class="val" id="ann">—</div></div>
+ <div class="card"><div class="lbl">Pagos cobrados</div><div class="val" id="pay">—</div></div>
+ <div class="card"><div class="lbl">Posición</div><div class="val" id="pos">—</div></div>
+</div>
+<p class="muted" style="margin-top:2rem;font-size:.8rem">Paper trading · delta-neutral · actualiza cada 10s</p>
+<script>
+ const pct=x=>(x>=0?'+':'')+(x*100).toFixed(2)+'%';
+ const cls=x=>x>=0?'pos':'neg';
+ async function tick(){
+  try{const r=await fetch('/api/carry');const d=await r.json();
+   document.getElementById('sym').textContent=d.symbol||'';
+   if(!d.exists){document.getElementById('state').textContent='sin estado todavía';return;}
+   document.getElementById('state').textContent='';
+   const eq=document.getElementById('eq');eq.textContent=d.equity.toFixed(2);
+   const dl=document.getElementById('delta');dl.textContent=(d.delta_vs_initial>=0?'+':'')+d.delta_vs_initial.toFixed(2);dl.className='val '+cls(d.delta_vs_initial);
+   const fu=document.getElementById('fund');fu.textContent=(d.accumulated_funding>=0?'+':'')+d.accumulated_funding.toFixed(2);fu.className='val '+cls(d.accumulated_funding);
+   const an=document.getElementById('ann');if(d.ann_return_est!=null){an.textContent=pct(d.ann_return_est);an.className='val '+cls(d.ann_return_est);}else an.textContent='—';
+   document.getElementById('pay').textContent=d.payments;
+   const p=document.getElementById('pos');p.innerHTML=d.position_open?'<span class="pill open">ABIERTA</span>':'<span class="pill flat">EN CASH</span>';
+  }catch(e){document.getElementById('state').textContent='error de conexión';}
+ }
+ tick();setInterval(tick,10000);
+</script></body></html>"#;
+
+#[derive(Clone)]
+struct CarryAppState {
+    db: Database,
+    symbol: String,
+}
+
+/// Arranca el dashboard del bot de carry. Reusa el patrón de `serve`.
+pub async fn serve_carry(cfg: Config, db: Database) -> anyhow::Result<()> {
+    let state = CarryAppState {
+        db,
+        symbol: cfg.symbol.clone(),
+    };
+    let app = Router::new()
+        .route("/", get(|| async { Html(CARRY_HTML) }))
+        .route("/api/carry", get(api_carry))
+        .with_state(state);
+
+    let addr: SocketAddr = format!("{}:{}", cfg.http_bind, cfg.http_port).parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("Dashboard de carry en http://{addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CarryView {
+    exists: bool,
+    symbol: String,
+    equity: f64,
+    initial_capital: f64,
+    delta_vs_initial: f64,
+    accumulated_funding: f64,
+    payments: i64,
+    position_open: bool,
+    ann_return_est: Option<f64>,
+}
+
+async fn api_carry(State(st): State<CarryAppState>) -> Result<Json<CarryView>, AppError> {
+    let c = st.db.load_carry_state().await?;
+    let view = match c {
+        None => CarryView {
+            exists: false,
+            symbol: st.symbol,
+            equity: 0.0,
+            initial_capital: 0.0,
+            delta_vs_initial: 0.0,
+            accumulated_funding: 0.0,
+            payments: 0,
+            position_open: false,
+            ann_return_est: None,
+        },
+        Some(c) => {
+            // Estimación de retorno anualizado: cada pago ~8h => payments/3 días.
+            let days = c.payments as f64 / 3.0;
+            let ann = if days > 0.5 && c.initial_capital > 0.0 {
+                Some((c.equity / c.initial_capital).powf(365.0 / days) - 1.0)
+            } else {
+                None
+            };
+            CarryView {
+                exists: true,
+                symbol: st.symbol,
+                equity: c.equity,
+                initial_capital: c.initial_capital,
+                delta_vs_initial: c.equity - c.initial_capital,
+                accumulated_funding: c.accumulated_funding,
+                payments: c.payments,
+                position_open: c.position_open,
+                ann_return_est: ann,
+            }
+        }
+    };
+    Ok(Json(view))
+}
+
 /// Adaptador de errores a respuesta HTTP 500 (sin filtrar pánico al daemon).
 struct AppError(anyhow::Error);
 
