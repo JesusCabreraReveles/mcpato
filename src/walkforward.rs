@@ -50,13 +50,28 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let end = chrono::Utc::now();
     let start = end - chrono::Duration::days(total_days as i64);
-    let candles = rest_binance::fetch_klines_range(
+    let mut candles = rest_binance::fetch_klines_range(
         &cfg.symbol,
         &cfg.interval,
         start.timestamp_millis(),
         end.timestamp_millis(),
     )
     .await?;
+
+    // Funding rates del perpetuo: dato ortogonal al precio (el experimento #2).
+    match rest_binance::fetch_funding_rates(
+        &cfg.symbol,
+        start.timestamp_millis(),
+        end.timestamp_millis(),
+    )
+    .await
+    {
+        Ok(funding) => {
+            println!("Funding: {} pagos descargados y fusionados", funding.len());
+            rest_binance::merge_funding(&mut candles, &funding);
+        }
+        Err(e) => eprintln!("warn: no se pudo descargar funding (features=0): {e:#}"),
+    }
 
     let day = cfg.candles_per_day.max(1);
     let train_len = train_days * day;

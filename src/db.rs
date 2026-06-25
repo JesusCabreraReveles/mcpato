@@ -390,6 +390,7 @@ impl Database {
                 low: row.get("low"),
                 close: row.get("close"),
                 volume: row.get("volume"),
+                funding_rate: 0.0,
             });
         }
         candles.reverse();

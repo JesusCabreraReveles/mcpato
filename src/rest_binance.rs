@@ -100,6 +100,70 @@ fn last_open_time(body: &str) -> Result<Option<i64>> {
     Ok(rows.last().and_then(|r| r.first()).and_then(|v| v.as_i64()))
 }
 
+/// Descarga el histórico de funding rates del perpetuo (USDT-M) en `[start, end]`.
+/// Devuelve `(fundingTime_ms, rate)` ordenado ascendente. El funding se paga cada
+/// 8h, así que son ~3 puntos al día (pocas páginas para años de datos).
+pub async fn fetch_funding_rates(
+    symbol: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<(i64, f64)>> {
+    let mut out: Vec<(i64, f64)> = Vec::new();
+    let mut cursor = start_ms;
+
+    loop {
+        let url = format!(
+            "https://fapi.binance.com/fapi/v1/fundingRate?symbol={}&startTime={}&endTime={}&limit=1000",
+            symbol.to_uppercase(),
+            cursor,
+            end_ms,
+        );
+        let body = reqwest::get(&url).await?.error_for_status()?.text().await?;
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&body).context("respuesta REST de funding no es JSON esperado")?;
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut last_time = cursor;
+        for r in &rows {
+            let t = r.get("fundingTime").and_then(|v| v.as_i64());
+            let rate = r
+                .get("fundingRate")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok());
+            if let (Some(t), Some(rate)) = (t, rate) {
+                out.push((t, rate));
+                last_time = last_time.max(t);
+            }
+        }
+
+        if rows.len() < 1000 || last_time + 1 > end_ms {
+            break;
+        }
+        cursor = last_time + 1;
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    out.sort_by_key(|(t, _)| *t);
+    Ok(out)
+}
+
+/// Adjunta a cada vela el funding rate vigente (último pago con `fundingTime <=
+/// vela.ts`), por forward-fill. Ambas series deben venir ordenadas ascendentes.
+pub fn merge_funding(candles: &mut [Candle], funding: &[(i64, f64)]) {
+    let mut i = 0usize;
+    let mut current = 0.0f64;
+    for c in candles.iter_mut() {
+        let ts_ms = c.ts.timestamp_millis();
+        while i < funding.len() && funding[i].0 <= ts_ms {
+            current = funding[i].1;
+            i += 1;
+        }
+        c.funding_rate = current;
+    }
+}
+
 /// Parsea la respuesta REST de klines. Descarta la última vela si aún se está
 /// formando (su `closeTime` está en el futuro respecto a `now_ms`).
 pub fn parse_klines(body: &str, now_ms: i64) -> Result<Vec<Candle>> {
@@ -134,6 +198,7 @@ pub fn parse_klines(body: &str, now_ms: i64) -> Result<Vec<Candle>> {
             low: num(&r[3])?,
             close: num(&r[4])?,
             volume: num(&r[5])?,
+            funding_rate: 0.0,
         });
     }
     Ok(candles)

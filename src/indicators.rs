@@ -47,15 +47,33 @@ pub fn compute_features(history: &[Candle], broker: &PaperBroker) -> [f64; INPUT
     f[14] = clamp(bollinger_b(&closes, 20), -3.0, 3.0);
     f[15] = clamp(stochastic_k(history, 14), -3.0, 3.0);
 
+    // Funding rate del perpetuo: dato ORTOGONAL al precio. Funding muy positivo =
+    // longs apiñados pagando (sesgo contrarian/sentimiento), y viceversa. Se mira
+    // el actual y la media reciente (régimen de funding). Escalado porque los
+    // valores son diminutos (~0.0001 por pago de 8h).
+    const FUND_SCALE: f64 = 500.0;
+    f[16] = clamp(history.last().map(|c| c.funding_rate).unwrap_or(0.0) * FUND_SCALE, -3.0, 3.0);
+    f[17] = clamp(funding_avg(history, 24) * FUND_SCALE, -3.0, 3.0);
+
     let equity = broker.equity.max(1e-12);
     let pos_val = broker.position_value(last_close);
     let unrealized = broker.unrealized_pnl(last_close);
 
-    f[16] = clamp(pos_val / equity, -3.0, 3.0);
-    f[17] = clamp(unrealized / equity, -3.0, 3.0);
-    f[18] = clamp(broker.max_drawdown, -3.0, 3.0);
+    f[18] = clamp(pos_val / equity, -3.0, 3.0);
+    f[19] = clamp(unrealized / equity, -3.0, 3.0);
+    f[20] = clamp(broker.max_drawdown, -3.0, 3.0);
 
     f
+}
+
+/// Media del funding rate de las últimas `period` velas (régimen de funding).
+fn funding_avg(history: &[Candle], period: usize) -> f64 {
+    if history.is_empty() {
+        return 0.0;
+    }
+    let start = history.len().saturating_sub(period);
+    let slice = &history[start..];
+    slice.iter().map(|c| c.funding_rate).sum::<f64>() / slice.len() as f64
 }
 
 /// Media simple de los últimos `period` valores.

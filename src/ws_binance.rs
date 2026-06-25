@@ -195,5 +195,6 @@ fn parse_candle(payload: &str) -> Result<Option<Candle>> {
         low: evt.k.low.parse()?,
         close: evt.k.close.parse()?,
         volume: evt.k.volume.parse()?,
+        funding_rate: 0.0,
     }))
 }

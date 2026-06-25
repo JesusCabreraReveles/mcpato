@@ -9,6 +9,9 @@ pub struct Candle {
     pub low: f64,
     pub close: f64,
     pub volume: f64,
+    /// Funding rate del perpetuo vigente en este instante (forward-fill desde el
+    /// último pago, cada 8h). 0.0 si no se tiene el dato (p. ej. en vivo todavía).
+    pub funding_rate: f64,
 }
 
 #[derive(Debug, Clone)]
