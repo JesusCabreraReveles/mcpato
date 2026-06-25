@@ -62,6 +62,7 @@ pub struct EvalResult {
     pub fitness: f64,
     pub equity_final: f64,
     pub max_drawdown: f64,
+    pub sharpe: f64,
     pub survival_ratio: f64,
     pub trades_count: i64,
     pub lived_candles: usize,

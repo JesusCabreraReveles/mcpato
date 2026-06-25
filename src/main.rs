@@ -12,6 +12,7 @@ mod oos;
 mod rest_binance;
 mod runtime;
 mod signals;
+mod walkforward;
 mod web;
 mod ws_binance;
 
@@ -34,6 +35,10 @@ async fn real_main() -> Result<()> {
     // Modo experimento: medición out-of-sample y salida (no arranca el daemon).
     if std::env::var("MCPATO_OOS_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
         return oos::run(cfg).await;
+    }
+    // Modo experimento: harness walk-forward multi-régimen y salida.
+    if std::env::var("MCPATO_WF_CHECK").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        return walkforward::run(cfg).await;
     }
 
     runtime::run(cfg).await

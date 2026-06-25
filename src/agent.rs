@@ -192,6 +192,7 @@ fn eval_result(
     cfg: &Config,
 ) -> EvalResult {
     let survival_ratio = (lived_candles as f64 / total_candles.max(1) as f64).clamp(0.0, 1.0);
+    let sharpe = sharpe_ratio(ret_sum, ret_sumsq, ret_n);
 
     let fitness = if !survived {
         // Filtro: cualquier muerte queda por debajo de cualquier superviviente.
@@ -204,7 +205,6 @@ fn eval_result(
             0.0
         };
         let alpha = agent_return - bench_return;
-        let sharpe = sharpe_ratio(ret_sum, ret_sumsq, ret_n);
 
         cfg.fit_w_alpha * alpha
             + cfg.fit_w_absolute * agent_return
@@ -218,6 +218,7 @@ fn eval_result(
         fitness,
         equity_final: broker.equity,
         max_drawdown: broker.max_drawdown,
+        sharpe,
         survival_ratio: if survived { 1.0 } else { survival_ratio },
         trades_count: broker.trades_count,
         lived_candles,
@@ -253,6 +254,7 @@ fn aggregate_windows(genome: Genome, results: Vec<EvalResult>) -> EvalResult {
         .iter()
         .map(|r| r.max_drawdown)
         .fold(0.0f64, f64::max);
+    let sharpe = results.iter().map(|r| r.sharpe).sum::<f64>() / k;
     let survival_ratio = results.iter().map(|r| r.survival_ratio).sum::<f64>() / k;
     let trades_count = results.iter().map(|r| r.trades_count).sum();
     let lived_candles = results.iter().map(|r| r.lived_candles).sum();
@@ -268,6 +270,7 @@ fn aggregate_windows(genome: Genome, results: Vec<EvalResult>) -> EvalResult {
         fitness,
         equity_final,
         max_drawdown,
+        sharpe,
         survival_ratio,
         trades_count,
         lived_candles,
